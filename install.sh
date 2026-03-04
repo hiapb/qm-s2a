@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ==========================================
-# Sub2API 高级一键运维管控域 (Manager) v2.0
-# 特性: 热备份(不停机) / 跨机一键恢复 / 双模式Crontab
+# Sub2API 高级一键运维管控域 (Manager) v2.1
+# 修复: 强制注入超管密码 / 正则端口映射 / y/N 交互
 # ==========================================
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -72,35 +72,34 @@ deploy_sub2api() {
     info "正在拉取核心拓扑文件..."
     curl -sSL "$COMPOSE_URL" -o docker-compose.local.yml || die "下载拓扑文件失败。"
 
-    # 精准修改端口绑定
-    sed -i "s/- \"8080:8080\"/- \"${host_port}:8080\"/g" docker-compose.local.yml
-    sed -i "s/- 8080:8080/- ${host_port}:8080/g" docker-compose.local.yml
+    # 【深度修复】使用高兼容性正则精准替换端口，无视双引号差异
+    sed -i -E "s/- \"?[0-9]+:8080\"?/- \"${host_port}:8080\"/g" docker-compose.local.yml
 
-    info "正在生成高强度加密凭证..."
+    info "正在生成高强度加密凭证与专属管理员账号..."
+    local admin_pass=$(openssl rand -hex 6)
+    
+    # 【深度修复】强制向内核注入确定性的超管账户，不依赖日志抓取
     cat > .env <<EOF
 POSTGRES_PASSWORD=$(openssl rand -hex 32)
 JWT_SECRET=$(openssl rand -hex 32)
 TOTP_ENCRYPTION_KEY=$(openssl rand -hex 32)
+ADMIN_EMAIL=admin@sub2api.com
+ADMIN_PASSWORD=${admin_pass}
 EOF
 
     mkdir -p data postgres_data redis_data
 
-    info "正在拉起微服务矩阵 (约需 1-2 分钟)..."
+    info "正在拉起微服务矩阵 (首次启动需拉取镜像，请耐心等待 1-3 分钟)..."
     $dc_cmd -f docker-compose.local.yml up -d
 
-    info "等待网关完成初始化..."
-    sleep 10
-
-    local admin_pwd=$($dc_cmd -f docker-compose.local.yml logs sub2api 2>/dev/null | grep -i "admin password" | awk -F'password: ' '{print $2}' | tr -d ' ' | tr -d '\r' || true)
     local server_ip=$(get_local_ip)
 
     echo -e "\n=================================================="
-    echo -e "\033[32m部署完成！您的专属 AI API 网关已就绪。\033[0m"
+    echo -e "\033[32m部署指令已下发！您的专属 AI API 网关正在启动。\033[0m"
+    echo -e "注意：云服务器请务必在安全组/防火墙中放行 \033[31m${host_port}\033[0m 端口！"
     echo -e "访问地址: \033[36mhttp://${server_ip}:${host_port}\033[0m"
-    if [[ -n "$admin_pwd" ]]; then
-        echo -e "超级管理员账号: \033[33madmin@sub2api.com\033[0m"
-        echo -e "超级管理员密码: \033[33m${admin_pwd}\033[0m"
-    fi
+    echo -e "超级管理员账号: \033[33madmin@sub2api.com\033[0m"
+    echo -e "超级管理员密码: \033[33m${admin_pass}\033[0m"
     echo -e "系统部署路径: ${install_path}"
     echo -e "==================================================\n"
 }
@@ -111,7 +110,7 @@ pause_service() {
     [[ -z "$workdir" ]] && die "未找到部署记录。"
     cd "$workdir"
     $(docker_compose_cmd) -f docker-compose.local.yml stop
-    info "服务已暂停。"
+    info "服务已停止。"
 }
 
 restart_service() {
@@ -135,7 +134,6 @@ do_backup() {
     info "开始执行业务零停机热备 (Hot Backup)..."
     cd "$workdir"
     
-    # ⚠️ 此时服务仍在运行，直接打包。容灾策略向可用性妥协。
     info "正在生成系统状态快照: $backup_file ..."
     tar -czf "$backup_file" docker-compose.local.yml .env data postgres_data redis_data
     
@@ -162,8 +160,8 @@ restore_backup() {
     
     if [[ -d "$target_dir" && -f "$target_dir/docker-compose.local.yml" ]]; then
         warn "目标目录已存在实例，恢复将覆盖现有数据！"
-        read -r -p "是否强制覆盖继续？(yes/no): " force_override
-        [[ "$force_override" != "yes" ]] && die "已终止恢复流程。"
+        read -r -p "是否强制覆盖继续？(y/N): " force_override
+        [[ ! "$force_override" =~ ^[Yy]$ ]] && die "已终止恢复流程。"
         # 强制下线旧容器防止冲突
         cd "$target_dir" && $(docker_compose_cmd) -f docker-compose.local.yml down || true
     fi
@@ -217,7 +215,6 @@ setup_auto_backup() {
         die "无效的选择。"
     fi
     
-    # 注入 Crontab 调度引擎
     local tmp_cron=$(mktemp)
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     cat >> "$tmp_cron" <<EOF
@@ -228,7 +225,7 @@ EOF
     crontab "$tmp_cron"
     rm -f "$tmp_cron"
     
-    info "任务已成功下发至系统底层的 Crontab 守护进程。"
+    info "任务已成功下发至系统调度引擎。"
 }
 
 # ---- 7. 销毁与卸载 ----
@@ -236,8 +233,8 @@ uninstall_service() {
     local workdir=$(get_workdir)
     [[ -z "$workdir" ]] && die "未检测到环境记录。"
     echo -e "\033[31m⚠️ 警告：这将彻底摧毁所有容器及业务数据！\033[0m"
-    read -r -p "确认核爆级卸载？(输入 yes 确认): " confirm
-    [[ "$confirm" != "yes" ]] && { info "已取消。"; return; }
+    read -r -p "确认完全卸载？(y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { info "已取消。"; return; }
     
     cd "$workdir"
     $(docker_compose_cmd) -f docker-compose.local.yml down -v || true
@@ -247,15 +244,14 @@ uninstall_service() {
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     crontab "$tmp_cron"
     rm -f "$tmp_cron"
-    info "系统净化完成。"
+    info "系统卸载与净化完成。"
 }
 
-# ---- 交互式主菜单 ----
 # ---- 交互式主菜单 ----
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Sub2API 运维控制台 v2.0               "
+    echo "               Sub2API 运维控制台 v2.1               "
     echo "==================================================="
     local wd=$(get_workdir)
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
@@ -288,7 +284,7 @@ main_menu() {
 if [[ "${1:-}" == "run-backup" ]]; then
     do_backup
 else
-    if [[ $EUID -ne 0 ]]; then die "权限收敛保护：请使用 root 权限执行脚本。"; fi
+    if [[ $EUID -ne 0 ]]; then die "权限拦截：请使用 root 权限执行脚本。"; fi
     while true; do
         main_menu
         read -r -p "按回车键重置终端..."
