@@ -69,13 +69,10 @@ deploy_sub2api() {
     read -r -p "请输入对外访问端口 [默认: 6082]: " input_port
     local host_port=${input_port:-6082}
 
-    read -r -p "请输入自定义 YAML 文件直链地址 [直接回车使用官方默认]: " input_url
-    local actual_url=${input_url:-$COMPOSE_URL}
-
     info "正在拉取核心拓扑文件..."
-    curl -sSL "$actual_url" -o docker-compose.local.yml || { err "下载拓扑文件失败。"; return; }
+    curl -sSL "$COMPOSE_URL" -o docker-compose.local.yml || { err "下载拓扑文件失败。"; return; }
 
-    info "正在生成高强度加密凭证与专属管理员账号..."
+    info "正在生成专属管理员账号..."
     local admin_pass=$(openssl rand -hex 6)
     
     cat > .env <<EOF
