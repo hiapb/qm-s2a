@@ -137,7 +137,7 @@ do_backup() {
     local timestamp=$(date +"%Y%m%d_%H%M%S")
     local backup_file="${backup_dir}/sub2api_backup_${timestamp}.tar.gz"
     
-    info "开始执行零停机热备..."
+    info "开始执行备份..."
     cd "$workdir" || return
     tar -czf "$backup_file" docker-compose.local.yml .env data postgres_data redis_data
     
@@ -364,6 +364,6 @@ else
     while true; do
         main_menu
         echo ""
-        read -r -p "➤ 任务执行完毕，按回车键返回主菜单..."
+        read -r -p "➤ 按回车键返回主菜单..."
     done
 fi
