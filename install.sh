@@ -58,7 +58,7 @@ deploy_sub2api() {
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
     
     if [[ -d "$install_path" && -f "$install_path/docker-compose.local.yml" ]]; then
-        err "该路径已存在部署实例，请先执行 [7] 卸载。"
+        err "该路径已存在部署实例，请先执行 [8] 卸载。"
         return 
     fi
 
@@ -72,7 +72,7 @@ deploy_sub2api() {
     info "正在拉取核心拓扑文件..."
     curl -sSL "$COMPOSE_URL" -o docker-compose.local.yml || { err "下载拓扑文件失败。"; return; }
 
-    info "正在生成高强度加密凭证与专属管理员账号..."
+    info "正在生成专属管理员账号..."
     local admin_pass=$(openssl rand -hex 6)
     
     cat > .env <<EOF
@@ -101,7 +101,21 @@ EOF
     echo -e "==================================================\n"
 }
 
-# ---- 2/3. 启停控制 ----
+# ---- 2. 升级服务 ----
+upgrade_service() {
+    local workdir=$(get_workdir)
+    if [[ -z "$workdir" ]]; then
+        err "未检测到运行中的网关，请先执行 [1] 一键部署。"
+        return
+    fi
+    cd "$workdir" || return
+    info "正在拉取最新镜像并重建容器..."
+    $(docker_compose_cmd) -f docker-compose.local.yml pull
+    $(docker_compose_cmd) -f docker-compose.local.yml up -d
+    info "升级服务完成！"
+}
+
+# ---- 3/4. 启停控制 ----
 pause_service() {
     local workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
@@ -124,7 +138,7 @@ restart_service() {
     info "服务已重启。"
 }
 
-# ---- 4. 零停机热备 ----
+# ---- 5. 零停机热备 ----
 do_backup() {
     local workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
@@ -153,7 +167,7 @@ do_backup() {
     done
 }
 
-# ---- 5. 跨机恢复 ----
+# ---- 6. 跨机恢复 ----
 restore_backup() {
     info "== 灾备恢复 / 数据迁入引擎 =="
     
@@ -215,7 +229,7 @@ restore_backup() {
     echo -e "==================================================\n"
 }
 
-# ---- 6. 自动化时钟 ----
+# ---- 7. 自动化时钟 ----
 setup_auto_backup() {
     require_cmd crontab
     info "== 定时备份策略管控 =="
@@ -283,7 +297,7 @@ EOF
     info "新的定时任务已成功注入调度引擎。"
 }
 
-# ---- 7. 彻底卸载 ----
+# ---- 8. 彻底卸载 ----
 uninstall_service() {
     local workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
@@ -331,26 +345,28 @@ main_menu() {
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
-    echo "  2) 停止服务"
-    echo "  3) 重启服务"
-    echo "  4) 手动备份"
-    echo "  5) 恢复备份"
-    echo "  6) 定时备份"
-    echo "  7) 完全卸载"
-    echo "  8) 📂 FTP/SFTP 备份工具"
+    echo "  2) 升级服务"
+    echo "  3) 停止服务"
+    echo "  4) 重启服务"
+    echo "  5) 手动备份"
+    echo "  6) 恢复备份"
+    echo "  7) 定时备份"
+    echo "  8) 完全卸载"
+    echo "  9) 📂 FTP/SFTP 备份工具"
     echo "  0) 退出脚本"
     echo "==================================================="
     
-    read -r -p "请输入操作序号 [0-7]: " choice
+    read -r -p "请输入操作序号 [0-9]: " choice
     case "$choice" in
         1) deploy_sub2api ;;
-        2) pause_service ;;
-        3) restart_service ;;
-        4) do_backup ;;
-        5) restore_backup ;;
-        6) setup_auto_backup ;;
-        7) uninstall_service ;;
-        8) install_ftp;;
+        2) upgrade_service ;;
+        3) pause_service ;;
+        4) restart_service ;;
+        5) do_backup ;;
+        6) restore_backup ;;
+        7) setup_auto_backup ;;
+        8) uninstall_service ;;
+        9) install_ftp;;
         0) info "欢迎下次使用，再见!"; exit 0 ;;
         *) warn "无效的指令，请重新输入。" ;;
     esac
