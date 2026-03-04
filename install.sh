@@ -337,7 +337,7 @@ main_menu() {
     echo "  5) 恢复备份"
     echo "  6) 定时备份"
     echo "  7) 完全卸载"
-    echo "  8) 📂 FTP/SFTP 备份工具
+    echo "  8) 📂 FTP/SFTP 备份工具"
     echo "  0) 退出脚本"
     echo "==================================================="
     
@@ -351,7 +351,7 @@ main_menu() {
         6) setup_auto_backup ;;
         7) uninstall_service ;;
         8) install_ftp;;
-        0) info "欢迎下次使用，再见！。"; exit 0 ;;
+        0) info "欢迎下次使用，再见!"; exit 0 ;;
         *) warn "无效的指令，请重新输入。" ;;
     esac
 }
