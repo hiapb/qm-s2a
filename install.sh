@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# 移除 set -euo pipefail，防止交互式菜单因非致命指令触发自爆退出
 
 # ==========================================
-# Sub2API 高级运维控制台 v2.5
-# 体验升维: 绝对路径直显 / 智能嗅探最新备份
+# Sub2API 运维控制台 
 # ==========================================
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -147,7 +145,6 @@ do_backup() {
     cd "$backup_dir" || return
     ls -t sub2api_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -I {} rm -f {}
     
-    # 【极致体验升级】直接输出绝对路径和文件大小，剔除噪音
     info "备份执行完毕。当前可用备份如下："
     for f in $(ls -t sub2api_backup_*.tar.gz 2>/dev/null); do
         local abs_path="${backup_dir}/${f}"
@@ -160,7 +157,6 @@ do_backup() {
 restore_backup() {
     info "== 灾备恢复 / 数据迁入引擎 =="
     
-    # 【极致体验升级】底层嗅探探针：自动寻找最新备份
     local default_backup=""
     local current_wd=$(get_workdir)
     local search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
@@ -172,10 +168,10 @@ restore_backup() {
     local backup_path=""
     if [[ -n "$default_backup" ]]; then
         echo -e "已智能嗅探到最新备份快照: \033[33m${default_backup}\033[0m"
-        read -r -p "请输入备份文件绝对路径 [直接回车使用默认]: " input_backup
+        read -r -p "请输入备份文件路径 [直接回车使用默认]: " input_backup
         backup_path=${input_backup:-$default_backup}
     else
-        read -r -p "请输入备份文件(.tar.gz)绝对路径: " backup_path
+        read -r -p "请输入备份文件(.tar.gz)路径: " backup_path
     fi
     
     if [[ ! -f "$backup_path" ]]; then 
@@ -183,7 +179,7 @@ restore_backup() {
         return
     fi
     
-    read -r -p "请输入期望恢复到的目标路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
+    read -r -p "请输入恢复到的目标路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local target_dir=${input_path:-$DEFAULT_INSTALL_PATH}
     
     if [[ -d "$target_dir" && -f "$target_dir/docker-compose.local.yml" ]]; then
@@ -212,7 +208,7 @@ restore_backup() {
     local admin_pass=$(grep -oP '^ADMIN_PASSWORD=\K.*' .env || echo "请查看.env文件")
     
     echo -e "\n=================================================="
-    echo -e "\033[32m✅ 恢复完成！全站业务已接管。\033[0m"
+    echo -e "\033[32m✅ Sub2API站点 恢复完成！\033[0m"
     echo -e "访问地址: \033[36mhttp://${server_ip}:${host_port}\033[0m"
     echo -e "超级管理员账号: \033[33m${admin_email}\033[0m"
     echo -e "超级管理员密码: \033[33m${admin_pass}\033[0m"
@@ -222,10 +218,27 @@ restore_backup() {
 # ---- 6. 自动化时钟 ----
 setup_auto_backup() {
     require_cmd crontab
-    info "== 设置定时备份策略 =="
+    info "== 定时备份策略管控 =="
+        local existing_cron=""
+    existing_cron=$(crontab -l 2>/dev/null | sed -n "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/p" | grep -v "^#" || true)
+    
+    if [[ -n "$existing_cron" ]]; then
+        echo -e "\033[36m>>> 发现当前正在运行的定时备份任务:\033[0m"
+        echo -e "\033[33m${existing_cron}\033[0m"
+        echo -e "---------------------------------------------------"
+        read -r -p "是否需要重新设置或覆盖该任务？(y/N): " reset_cron
+        if [[ ! "$reset_cron" =~ ^[Yy]$ ]]; then
+            info "已保留当前配置，操作取消。"
+            return
+        fi
+    else
+        echo -e "当前未检测到针对该项目的定时备份任务。"
+    fi
+
     echo " 1) 按分钟间隔循环备份 (例如：每 30 分钟)"
     echo " 2) 按每日固定时间点备份 (例如：每天 02:30)"
-    read -r -p "请选择策略 [1/2]: " cron_type
+    echo " 3) 删除当前的定时备份任务"
+    read -r -p "请选择策略 [1/2/3]: " cron_type
     
     local cron_spec=""
     
@@ -233,7 +246,7 @@ setup_auto_backup() {
         read -r -p "请输入间隔分钟数 (例如 30): " min_interval
         if [[ ! "$min_interval" =~ ^[1-9][0-9]*$ ]]; then err "输入无效。"; return; fi
         cron_spec="*/${min_interval} * * * *"
-        info "已选择：每 $min_interval 分钟执行一次。"
+        info "已下发指令：每 $min_interval 分钟执行一次。"
     elif [[ "$cron_type" == "2" ]]; then
         read -r -p "请输入每天固定备份时间 (格式 HH:MM): " cron_time
         if [[ ! "$cron_time" =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then err "时间格式不正确。"; return; fi
@@ -242,12 +255,21 @@ setup_auto_backup() {
         hour=$(echo "$hour" | sed 's/^0*//'); [[ -z "$hour" ]] && hour="0"
         minute=$(echo "$minute" | sed 's/^0*//'); [[ -z "$minute" ]] && minute="0"
         cron_spec="${minute} ${hour} * * *"
-        info "已选择：每天 $cron_time 执行一次。"
+        info "已下发指令：每天 $cron_time 执行一次。"
+    elif [[ "$cron_type" == "3" ]]; then
+        # 执行删除操作
+        local tmp_cron=$(mktemp)
+        crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
+        crontab "$tmp_cron" 2>/dev/null || true
+        rm -f "$tmp_cron"
+        info "定时备份任务已被成功清理。"
+        return
     else
         err "无效的选择。"
         return
     fi
     
+    # 写入新任务
     local tmp_cron=$(mktemp)
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     cat >> "$tmp_cron" <<EOF
@@ -258,7 +280,7 @@ EOF
     crontab "$tmp_cron" 2>/dev/null || true
     rm -f "$tmp_cron"
     
-    info "定时任务已成功注入调度引擎。"
+    info "新的定时任务已成功注入调度引擎。"
 }
 
 # ---- 7. 彻底卸载 ----
@@ -288,14 +310,22 @@ uninstall_service() {
     crontab "$tmp_cron" 2>/dev/null || true
     rm -f "$tmp_cron" || true
     
-    info "系统净化完成，所有资产与痕迹已被安全抹除。"
+    info "容器及业务数据已被安全抹除。"
+}
+
+install_ftp(){
+    clear
+    echo -e "${GREEN}📂 FTP/SFTP 备份工具...${RESET}"
+    bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
+    sleep 2
+    exit 0
 }
 
 # ---- 交互式主菜单 ----
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Sub2API 运维控制台 v2.5               "
+    echo "                 Sub2API 运维控制台                "
     echo "==================================================="
     local wd=$(get_workdir)
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
@@ -307,6 +337,7 @@ main_menu() {
     echo "  5) 恢复备份"
     echo "  6) 定时备份"
     echo "  7) 完全卸载"
+    echo "  8) 📂 FTP/SFTP 备份工具
     echo "  0) 退出脚本"
     echo "==================================================="
     
@@ -319,7 +350,8 @@ main_menu() {
         5) restore_backup ;;
         6) setup_auto_backup ;;
         7) uninstall_service ;;
-        0) info "系统登出。"; exit 0 ;;
+        8) install_ftp;;
+        0) info "欢迎下次使用，再见！。"; exit 0 ;;
         *) warn "无效的指令，请重新输入。" ;;
     esac
 }
@@ -332,6 +364,6 @@ else
     while true; do
         main_menu
         echo ""
-        read -r -p "➤ 任务执行完毕，按回车键返回工作台..."
+        read -r -p "➤ 任务执行完毕，按回车键返回主菜单..."
     done
 fi
