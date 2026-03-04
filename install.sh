@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 移除 set -euo pipefail，防止交互式菜单因非致命指令（如 crontab -l 为空）触发自爆退出
+# 移除 set -euo pipefail，防止交互式菜单因非致命指令触发自爆退出
 
 # ==========================================
-# Sub2API 高级运维控制台 v2.3
-# 修复: 柔性异常拦截 / 菜单防崩 / 取消自爆模式
+# Sub2API 高级运维控制台 v2.5
+# 体验升维: 绝对路径直显 / 智能嗅探最新备份
 # ==========================================
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -17,8 +17,8 @@ BACKUP_LOG="/var/log/sub2api_backup.log"
 # ---- 基础工具函数 ----
 info() { echo -e "\033[32m[INFO]\033[0m $1"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
-err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; } # 柔性报错，不退出脚本
-die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; } # 仅用于底层环境严重缺失
+err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
+die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "系统缺少核心依赖: $1，请安装后重试。"
@@ -61,7 +61,7 @@ deploy_sub2api() {
     
     if [[ -d "$install_path" && -f "$install_path/docker-compose.local.yml" ]]; then
         err "该路径已存在部署实例，请先执行 [7] 卸载。"
-        return # 柔性返回菜单
+        return 
     fi
 
     mkdir -p "$install_path"
@@ -147,17 +147,39 @@ do_backup() {
     cd "$backup_dir" || return
     ls -t sub2api_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -I {} rm -f {}
     
+    # 【极致体验升级】直接输出绝对路径和文件大小，剔除噪音
     info "备份执行完毕。当前可用备份如下："
-    ls -lh sub2api_backup_*.tar.gz
+    for f in $(ls -t sub2api_backup_*.tar.gz 2>/dev/null); do
+        local abs_path="${backup_dir}/${f}"
+        local fsize=$(du -h "$f" | cut -f1)
+        echo -e "  📦 \033[36m${abs_path}\033[0m (大小: ${fsize})"
+    done
 }
 
 # ---- 5. 跨机恢复 ----
 restore_backup() {
     info "== 灾备恢复 / 数据迁入引擎 =="
-    read -r -p "请输入备份文件(.tar.gz)绝对路径: " backup_path
+    
+    # 【极致体验升级】底层嗅探探针：自动寻找最新备份
+    local default_backup=""
+    local current_wd=$(get_workdir)
+    local search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
+    
+    if [[ -d "$search_dir" ]]; then
+        default_backup=$(ls -t "${search_dir}"/sub2api_backup_*.tar.gz 2>/dev/null | head -n 1 || true)
+    fi
+    
+    local backup_path=""
+    if [[ -n "$default_backup" ]]; then
+        echo -e "已智能嗅探到最新备份快照: \033[33m${default_backup}\033[0m"
+        read -r -p "请输入备份文件绝对路径 [直接回车使用默认]: " input_backup
+        backup_path=${input_backup:-$default_backup}
+    else
+        read -r -p "请输入备份文件(.tar.gz)绝对路径: " backup_path
+    fi
     
     if [[ ! -f "$backup_path" ]]; then 
-        err "找不到指定的备份文件，请检查路径。"
+        err "目标路径下未找到有效的快照文件，请检查。"
         return
     fi
     
@@ -185,10 +207,16 @@ restore_backup() {
     $(docker_compose_cmd) -f docker-compose.local.yml up -d || { err "恢复启动失败。"; return; }
     
     local server_ip=$(get_local_ip)
-    local host_port=$(grep -oP '^SERVER_PORT=\K\d+' .env || echo "8080")
+    local host_port=$(grep -oP '^SERVER_PORT=\K.*' .env || echo "8080")
+    local admin_email=$(grep -oP '^ADMIN_EMAIL=\K.*' .env || echo "admin@sub2api.com")
+    local admin_pass=$(grep -oP '^ADMIN_PASSWORD=\K.*' .env || echo "请查看.env文件")
     
-    info "✅ 恢复完成！全站业务已接管。"
-    info "访问地址: http://${server_ip}:${host_port}"
+    echo -e "\n=================================================="
+    echo -e "\033[32m✅ 恢复完成！全站业务已接管。\033[0m"
+    echo -e "访问地址: \033[36mhttp://${server_ip}:${host_port}\033[0m"
+    echo -e "超级管理员账号: \033[33m${admin_email}\033[0m"
+    echo -e "超级管理员密码: \033[33m${admin_pass}\033[0m"
+    echo -e "==================================================\n"
 }
 
 # ---- 6. 自动化时钟 ----
@@ -221,7 +249,6 @@ setup_auto_backup() {
     fi
     
     local tmp_cron=$(mktemp)
-    # 忽略 crontab -l 的错误，防止管道断裂
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     cat >> "$tmp_cron" <<EOF
 ${CRON_TAG_BEGIN}
@@ -268,7 +295,7 @@ uninstall_service() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "               Sub2API 运维控制台 v2.3               "
+    echo "               Sub2API 运维控制台 v2.5               "
     echo "==================================================="
     local wd=$(get_workdir)
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
