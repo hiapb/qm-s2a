@@ -4,7 +4,6 @@
 # Sub2API 运维控制台
 # ==========================================
 
-# 强行注入系统全量环境变量，防止非交互式环境指令失联
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
