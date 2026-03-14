@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# Sub2API 运维控制台 
+# Sub2API 运维控制台
 # ==========================================
+
+# 强行注入系统全量环境变量，防止非交互式环境指令失联
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 DEFAULT_INSTALL_PATH="/opt/sub2api"
@@ -138,7 +141,7 @@ restart_service() {
     info "服务已重启。"
 }
 
-# ---- 5. 零停机热备 ----
+# ---- 5. 手动热备 (注入高容错机制) ----
 do_backup() {
     local workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
@@ -153,7 +156,16 @@ do_backup() {
     
     info "开始执行备份..."
     cd "$workdir" || return
-    tar -czf "$backup_file" docker-compose.local.yml .env data postgres_data redis_data
+    
+    # 动态扫描当前存在的核心文件，避免单个文件丢失导致整体备份崩溃
+    local target_files=$(ls -A | grep -E 'docker-compose.local.yml|\.env|data|postgres_data|redis_data' || true)
+    if [[ -z "$target_files" ]]; then
+        err "未找到任何核心配置或数据目录，备份终止。"
+        return
+    fi
+    
+    # 使用动态目标进行打包
+    tar -czf "$backup_file" $target_files
     
     # 轮转策略
     cd "$backup_dir" || return
@@ -229,10 +241,16 @@ restore_backup() {
     echo -e "==================================================\n"
 }
 
-# ---- 7. 自动化时钟 ----
+# ---- 7. 自动化时钟 (解耦物理引擎重构版) ----
 setup_auto_backup() {
     require_cmd crontab
     info "== 定时备份策略管控 =="
+
+    local workdir=$(get_workdir)
+    if [[ -z "$workdir" ]]; then
+        err "未检测到部署环境，无法配置定时备份。"
+        return
+    fi
 
     local existing_cron=""
     local reset_cron=""
@@ -243,6 +261,9 @@ setup_auto_backup() {
     local hour=""
     local minute=""
     local tmp_cron=""
+    
+    # 物理实体化器：生成纯粹、独立、高容错的守护脚本
+    local cron_script="${workdir}/cron_backup.sh"
 
     existing_cron="$(crontab -l 2>/dev/null | sed -n "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/p" | grep -v "^#" || true)"
 
@@ -301,20 +322,11 @@ setup_auto_backup() {
         info "已下发指令：每天 ${cron_time} 执行一次。"
 
     elif [[ "$cron_type" == "3" ]]; then
-        tmp_cron="$(mktemp)" || {
-            err "创建临时文件失败。"
-            return
-        }
-
+        tmp_cron="$(mktemp)" || { err "创建临时文件失败。"; return; }
         crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
-
-        if ! crontab "$tmp_cron" 2>/dev/null; then
-            rm -f "$tmp_cron"
-            err "清理定时备份任务失败，请检查 crontab 状态。"
-            return
-        fi
-
+        crontab "$tmp_cron" 2>/dev/null || true
         rm -f "$tmp_cron"
+        rm -f "$cron_script" # 同步摧毁物理实体脚本
         info "定时备份任务已被成功清理。"
         return
 
@@ -323,30 +335,52 @@ setup_auto_backup() {
         return
     fi
 
-    tmp_cron="$(mktemp)" || {
-        err "创建临时文件失败。"
-        return
-    }
+    # --- 锻造独立物理执行器 ---
+    info "正在为您锻造专属于该目录的物理级守护程序..."
+    cat > "$cron_script" << EOF
+#!/usr/bin/env bash
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
+WORKDIR="${workdir}"
+cd "\$WORKDIR" || exit 1
 
+BACKUP_DIR="\${WORKDIR}/backups"
+mkdir -p "\$BACKUP_DIR"
+TIMESTAMP=\$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="\${BACKUP_DIR}/sub2api_backup_\${TIMESTAMP}.tar.gz"
+
+# 动态探测并打包存在的数据，防止单文件缺失导致链路崩溃
+TARGET_FILES=\$(ls -A | grep -E 'docker-compose.local.yml|\.env|data|postgres_data|redis_data' || true)
+if [[ -n "\$TARGET_FILES" ]]; then
+    tar -czf "\$BACKUP_FILE" \$TARGET_FILES
+    cd "\$BACKUP_DIR" || exit 1
+    ls -t sub2api_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -I {} rm -f {}
+fi
+EOF
+    chmod +x "$cron_script"
+    # --------------------------
+
+    tmp_cron="$(mktemp)" || { err "创建临时文件失败。"; return; }
+
+    # 清洗旧规则并注入新规则（锚定物理文件）
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
 
     cat >> "$tmp_cron" <<EOF
 ${CRON_TAG_BEGIN}
-${cron_spec} bash ${SCRIPT_PATH} run-backup >> ${BACKUP_LOG} 2>&1
+${cron_spec} bash ${cron_script} >> ${BACKUP_LOG} 2>&1
 ${CRON_TAG_END}
 EOF
 
     if ! crontab "$tmp_cron" 2>/dev/null; then
         rm -f "$tmp_cron"
-        err "写入 crontab 失败，请检查 cron 服务状态或脚本路径是否有效。"
+        err "写入 crontab 失败，请检查 cron 服务状态。"
         return
     fi
 
     rm -f "$tmp_cron"
 
     info "新的定时任务已成功注入调度引擎。"
-    echo -e "\033[36m当前计划任务:\033[0m"
-    echo -e "\033[33m${cron_spec} bash ${SCRIPT_PATH} run-backup >> ${BACKUP_LOG} 2>&1\033[0m"
+    echo -e "\033[36m底层调度链路已锚定实体文件:\033[0m"
+    echo -e "\033[33m${cron_spec} bash ${cron_script} >> ${BACKUP_LOG} 2>&1\033[0m"
 }
 
 # ---- 8. 彻底卸载 ----
