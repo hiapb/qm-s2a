@@ -351,7 +351,6 @@ restore_backup() {
     backup_real_path=$(readlink -f "$backup_path") || { err "无法解析备份文件真实路径。"; return; }
     backup_path="$backup_real_path"
     info "已锁定恢复快照：${backup_path}"
-    info "恢复流程只读取该备份文件，不会删除或轮转该文件。"
 
     read -r -p "请输入恢复到的目标路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local target_dir=${input_path:-$DEFAULT_INSTALL_PATH}
