@@ -421,7 +421,7 @@ do_backup() {
 }
 
 restore_backup() {
-    local current_wd search_dir default_backup backup_path target_dir host_port restored_port
+    local current_wd search_dir default_backup backup_path safe_backup target_dir host_port restored_port
 
     current_wd="$(get_workdir)"
     search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
@@ -430,23 +430,39 @@ restore_backup() {
     read_default "请输入备份文件路径" "$default_backup" backup_path
     [[ -f "$backup_path" ]] || { err "未找到备份文件。"; return; }
 
+    safe_backup="/tmp/$(basename "$backup_path")"
+    cp "$backup_path" "$safe_backup" || {
+        err "备份文件复制到临时目录失败。"
+        return
+    }
+
     read_default "请输入恢复到的目标路径" "$DEFAULT_INSTALL_PATH" target_dir
 
     if [[ -d "$target_dir" && "$(ls -A "$target_dir" 2>/dev/null)" ]]; then
         warn "目标目录已存在: ${target_dir}"
-        confirm_yes "是否停止并覆盖该实例数据" || return
+        confirm_yes "是否停止并覆盖该实例数据" || {
+            rm -f "$safe_backup"
+            return
+        }
         if [[ -f "${target_dir}/${COMPOSE_FILE}" ]]; then
             ensure_instance_files "$target_dir" || true
             compose "$target_dir" down || true
         fi
-        safe_remove_dir "$target_dir" || return
+        safe_remove_dir "$target_dir" || {
+            rm -f "$safe_backup"
+            return
+        }
     fi
 
     mkdir -p "$target_dir" || return
-    tar -xzf "$backup_path" -C "$target_dir" || {
+    tar -xzf "$safe_backup" -C "$target_dir" || {
+        rm -f "$safe_backup"
         err "恢复失败，备份包可能已损坏。"
         return
     }
+    mkdir -p "${target_dir}/backups"
+    cp "$safe_backup" "${target_dir}/backups/$(basename "$safe_backup")" 2>/dev/null || true
+    rm -f "$safe_backup"
 
     echo "$target_dir" > "$ENV_RECORD_FILE"
     ensure_instance_files "$target_dir" || return
