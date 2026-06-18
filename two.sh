@@ -8,7 +8,7 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 set -o pipefail
 
-APP_NAME="Sub2API2"
+APP_NAME="Sub2API 2"
 INSTANCE_ID="${SUB2API_INSTANCE_ID:-sub2api2}"
 DEFAULT_PORT="${SUB2API_DEFAULT_PORT:-6083}"
 DEFAULT_INSTALL_PATH="${SUB2API_INSTALL_PATH:-/opt/${INSTANCE_ID}}"
@@ -647,7 +647,7 @@ do_backup() {
 
 restore_backup() {
     local current_wd search_dir default_backup backup_path safe_backup target_dir host_port restored_port
-    local tmp_extract is_hot_backup pg_container pg_user pg_db pg_password db_ident user_ident db_lit restore_sql
+    local tmp_extract is_hot_backup pg_container pg_user pg_db pg_password db_ident user_ident db_lit
 
     current_wd="$(get_workdir)"
     search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
@@ -769,14 +769,30 @@ restore_backup() {
         db_ident="$(pg_ident "$pg_db")"
         user_ident="$(pg_ident "$pg_user")"
         db_lit="$(sql_literal "$pg_db")"
-        restore_sql="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ${db_lit} AND pid <> pg_backend_pid(); DROP DATABASE IF EXISTS ${db_ident}; CREATE DATABASE ${db_ident} OWNER ${user_ident};"
 
-        info "正在重建并导入 PostgreSQL 数据库..."
+        info "正在重建 PostgreSQL 数据库..."
         docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
-            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 -c "$restore_sql" || {
-            err "重建数据库失败。"
+            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ${db_lit} AND pid <> pg_backend_pid();" || {
+            err "终止数据库连接失败。"
             return
         }
+
+        docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
+            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS ${db_ident};" || {
+            err "删除旧数据库失败。"
+            return
+        }
+
+        docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
+            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE ${db_ident} OWNER ${user_ident};" || {
+            err "创建新数据库失败。"
+            return
+        }
+
+        info "正在导入 PostgreSQL 数据..."
 
         local sql_dump_path
         sql_dump_path="${target_dir}/backups/postgres_dump.sql.gz"
