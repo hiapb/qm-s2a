@@ -319,7 +319,8 @@ create_hot_backup() {
     local backup_file="$2"
     local env_file="${workdir}/.env"
     local stage_dir hot_dir pg_container redis_container
-    local pg_user pg_db pg_password redis_bgsave_before redis_bgsave_after
+    local pg_user pg_db pg_password
+    local redis_bgsave_before redis_bgsave_after redis_dir redis_dbfilename redis_rdb_path rdb_in_progress
     local app_data_status=0 redis_status=0 redis_rdb_ok=0 redis_bgsave_ok=0
 
     stage_dir="$(mktemp -d)" || return 1
@@ -373,45 +374,64 @@ create_hot_backup() {
     if container_running "$redis_container"; then
         info "正在热备份 Redis 快照..."
         if docker exec "$redis_container" redis-cli PING >/dev/null 2>&1; then
+            redis_status=1
             redis_rdb_ok=0
-            redis_status=0
+            redis_bgsave_ok=0
 
-            if docker exec "$redis_container" sh -c 'redis-cli --help 2>/dev/null | grep -q -- --rdb' >/dev/null 2>&1; then
-                info "Redis 支持 --rdb，优先尝试在线导出 RDB..."
-                docker exec "$redis_container" sh -c 'rm -f /tmp/sub2api_redis_dump.rdb && redis-cli --rdb /tmp/sub2api_redis_dump.rdb >/dev/null' >/dev/null 2>&1
+            redis_bgsave_before="$(docker exec "$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+            redis_bgsave_before="${redis_bgsave_before:-0}"
+
+            info "正在触发 Redis BGSAVE，并等待后台快照完成..."
+            docker exec "$redis_container" redis-cli BGSAVE >/dev/null 2>&1 || true
+            for _ in {1..120}; do
+                rdb_in_progress="$(docker exec "$redis_container" sh -c "redis-cli INFO persistence 2>/dev/null | tr -d '\r' | awk -F: '/^rdb_bgsave_in_progress:/ {print \$2}'" || true)"
+                redis_bgsave_after="$(docker exec "$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+                redis_bgsave_after="${redis_bgsave_after:-0}"
+
+                if [[ "$rdb_in_progress" == "0" ]]; then
+                    redis_bgsave_ok=1
+                    break
+                fi
+
+                if [[ "$redis_bgsave_after" =~ ^[0-9]+$ && "$redis_bgsave_before" =~ ^[0-9]+$ && "$redis_bgsave_after" -gt "$redis_bgsave_before" ]]; then
+                    redis_bgsave_ok=1
+                    break
+                fi
+                sleep 1
+            done
+
+            redis_dir="$(docker exec "$redis_container" sh -c "redis-cli --raw CONFIG GET dir 2>/dev/null | tail -n 1 | tr -d '\r'" || true)"
+            redis_dbfilename="$(docker exec "$redis_container" sh -c "redis-cli --raw CONFIG GET dbfilename 2>/dev/null | tail -n 1 | tr -d '\r'" || true)"
+            redis_dir="${redis_dir:-/data}"
+            redis_dbfilename="${redis_dbfilename:-dump.rdb}"
+
+            info "正在从 Redis 容器真实 RDB 路径复制快照..."
+            for redis_rdb_path in "${redis_dir}/${redis_dbfilename}" "/data/dump.rdb" "/var/lib/redis/dump.rdb"; do
+                if docker cp "${redis_container}:${redis_rdb_path}" "${hot_dir}/redis_dump.rdb" >/dev/null 2>&1; then
+                    redis_rdb_ok=1
+                    redis_status=0
+                    break
+                fi
+            done
+
+            if [[ "$redis_rdb_ok" -ne 1 ]]; then
+                warn "从 Redis 容器复制 RDB 失败，尝试 redis-cli --rdb 在线导出。"
+                docker exec "$redis_container" sh -c 'rm -f /tmp/sub2api_redis_dump.rdb && redis-cli --rdb /tmp/sub2api_redis_dump.rdb >/dev/null' >/dev/null 2>&1 || true
                 if docker cp "${redis_container}:/tmp/sub2api_redis_dump.rdb" "${hot_dir}/redis_dump.rdb" >/dev/null 2>&1; then
                     redis_rdb_ok=1
                     redis_status=0
-                else
-                    redis_status=1
-                    warn "Redis --rdb 导出或复制失败，准备降级尝试 BGSAVE 快照。"
                 fi
                 docker exec "$redis_container" rm -f /tmp/sub2api_redis_dump.rdb >/dev/null 2>&1 || true
             fi
 
             if [[ "$redis_rdb_ok" -ne 1 ]]; then
-                redis_bgsave_ok=0
-                redis_bgsave_before="$(docker exec "$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
-                redis_bgsave_before="${redis_bgsave_before:-0}"
-
-                docker exec "$redis_container" redis-cli BGSAVE >/dev/null 2>&1 || true
-                for _ in {1..60}; do
-                    redis_bgsave_after="$(docker exec "$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
-                    redis_bgsave_after="${redis_bgsave_after:-0}"
-                    if [[ "$redis_bgsave_after" =~ ^[0-9]+$ && "$redis_bgsave_before" =~ ^[0-9]+$ && "$redis_bgsave_after" -gt "$redis_bgsave_before" ]]; then
-                        redis_bgsave_ok=1
-                        break
-                    fi
-                    sleep 1
-                done
-
-                if [[ "$redis_bgsave_ok" -ne 1 ]]; then
-                    redis_status=1
-                    warn "Redis BGSAVE 等待超时或 LASTSAVE 异常，将尝试打包现有 redis_data。"
-                fi
-
+                warn "Redis RDB 导出失败，最后尝试打包宿主机 redis_data 目录。"
                 if [[ -d "${workdir}/redis_data" ]]; then
-                    tar --warning=no-file-changed --ignore-failed-read -czf "${hot_dir}/redis_data.tar.gz" -C "$workdir" redis_data || redis_status=$?
+                    if tar --warning=no-file-changed --ignore-failed-read -czf "${hot_dir}/redis_data.tar.gz" -C "$workdir" redis_data; then
+                        redis_status=0
+                    else
+                        redis_status=$?
+                    fi
                 else
                     redis_status=1
                 fi
@@ -902,7 +922,8 @@ create_hot_backup() {
     local backup_file="\$1"
     local env_file="\${WORKDIR}/.env"
     local stage_dir hot_dir pg_container redis_container
-    local pg_user pg_db pg_password redis_bgsave_before redis_bgsave_after
+    local pg_user pg_db pg_password
+    local redis_bgsave_before redis_bgsave_after redis_dir redis_dbfilename redis_rdb_path rdb_in_progress
     local app_data_status=0 redis_status=0 redis_rdb_ok=0 redis_bgsave_ok=0
 
     stage_dir="\$(mktemp -d)" || return 1
@@ -946,45 +967,64 @@ create_hot_backup() {
     if container_running "\$redis_container"; then
         info "正在热备份 Redis 快照..."
         if docker exec "\$redis_container" redis-cli PING >/dev/null 2>&1; then
+            redis_status=1
             redis_rdb_ok=0
-            redis_status=0
+            redis_bgsave_ok=0
 
-            if docker exec "\$redis_container" sh -c 'redis-cli --help 2>/dev/null | grep -q -- --rdb' >/dev/null 2>&1; then
-                info "Redis 支持 --rdb，优先尝试在线导出 RDB..."
-                docker exec "\$redis_container" sh -c 'rm -f /tmp/sub2api_redis_dump.rdb && redis-cli --rdb /tmp/sub2api_redis_dump.rdb >/dev/null' >/dev/null 2>&1
+            redis_bgsave_before="\$(docker exec "\$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+            redis_bgsave_before="\${redis_bgsave_before:-0}"
+
+            info "正在触发 Redis BGSAVE，并等待后台快照完成..."
+            docker exec "\$redis_container" redis-cli BGSAVE >/dev/null 2>&1 || true
+            for _ in {1..120}; do
+                rdb_in_progress="\$(docker exec "\$redis_container" sh -c "redis-cli INFO persistence 2>/dev/null | tr -d '\r' | awk -F: '/^rdb_bgsave_in_progress:/ {print \\$2}'" || true)"
+                redis_bgsave_after="\$(docker exec "\$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+                redis_bgsave_after="\${redis_bgsave_after:-0}"
+
+                if [[ "\$rdb_in_progress" == "0" ]]; then
+                    redis_bgsave_ok=1
+                    break
+                fi
+
+                if [[ "\$redis_bgsave_after" =~ ^[0-9]+$ && "\$redis_bgsave_before" =~ ^[0-9]+$ && "\$redis_bgsave_after" -gt "\$redis_bgsave_before" ]]; then
+                    redis_bgsave_ok=1
+                    break
+                fi
+                sleep 1
+            done
+
+            redis_dir="\$(docker exec "\$redis_container" sh -c "redis-cli --raw CONFIG GET dir 2>/dev/null | tail -n 1 | tr -d '\r'" || true)"
+            redis_dbfilename="\$(docker exec "\$redis_container" sh -c "redis-cli --raw CONFIG GET dbfilename 2>/dev/null | tail -n 1 | tr -d '\r'" || true)"
+            redis_dir="\${redis_dir:-/data}"
+            redis_dbfilename="\${redis_dbfilename:-dump.rdb}"
+
+            info "正在从 Redis 容器真实 RDB 路径复制快照..."
+            for redis_rdb_path in "\${redis_dir}/\${redis_dbfilename}" "/data/dump.rdb" "/var/lib/redis/dump.rdb"; do
+                if docker cp "\${redis_container}:\${redis_rdb_path}" "\${hot_dir}/redis_dump.rdb" >/dev/null 2>&1; then
+                    redis_rdb_ok=1
+                    redis_status=0
+                    break
+                fi
+            done
+
+            if [[ "\$redis_rdb_ok" -ne 1 ]]; then
+                warn "从 Redis 容器复制 RDB 失败，尝试 redis-cli --rdb 在线导出。"
+                docker exec "\$redis_container" sh -c 'rm -f /tmp/sub2api_redis_dump.rdb && redis-cli --rdb /tmp/sub2api_redis_dump.rdb >/dev/null' >/dev/null 2>&1 || true
                 if docker cp "\${redis_container}:/tmp/sub2api_redis_dump.rdb" "\${hot_dir}/redis_dump.rdb" >/dev/null 2>&1; then
                     redis_rdb_ok=1
                     redis_status=0
-                else
-                    redis_status=1
-                    warn "Redis --rdb 导出或复制失败，准备降级尝试 BGSAVE 快照。"
                 fi
                 docker exec "\$redis_container" rm -f /tmp/sub2api_redis_dump.rdb >/dev/null 2>&1 || true
             fi
 
             if [[ "\$redis_rdb_ok" -ne 1 ]]; then
-                redis_bgsave_ok=0
-                redis_bgsave_before="\$(docker exec "\$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
-                redis_bgsave_before="\${redis_bgsave_before:-0}"
-
-                docker exec "\$redis_container" redis-cli BGSAVE >/dev/null 2>&1 || true
-                for _ in {1..60}; do
-                    redis_bgsave_after="\$(docker exec "\$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
-                    redis_bgsave_after="\${redis_bgsave_after:-0}"
-                    if [[ "\$redis_bgsave_after" =~ ^[0-9]+$ && "\$redis_bgsave_before" =~ ^[0-9]+$ && "\$redis_bgsave_after" -gt "\$redis_bgsave_before" ]]; then
-                        redis_bgsave_ok=1
-                        break
-                    fi
-                    sleep 1
-                done
-
-                if [[ "\$redis_bgsave_ok" -ne 1 ]]; then
-                    redis_status=1
-                    warn "Redis BGSAVE 等待超时或 LASTSAVE 异常，将尝试打包现有 redis_data。"
-                fi
-
+                warn "Redis RDB 导出失败，最后尝试打包宿主机 redis_data 目录。"
                 if [[ -d "\${WORKDIR}/redis_data" ]]; then
-                    tar --warning=no-file-changed --ignore-failed-read -czf "\${hot_dir}/redis_data.tar.gz" -C "\$WORKDIR" redis_data || redis_status=\$?
+                    if tar --warning=no-file-changed --ignore-failed-read -czf "\${hot_dir}/redis_data.tar.gz" -C "\$WORKDIR" redis_data; then
+                        redis_status=0
+                    else
+                        redis_status=\$?
+                    fi
                 else
                     redis_status=1
                 fi
