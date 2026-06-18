@@ -234,6 +234,221 @@ compose() {
     fi
 }
 
+
+get_container_name() {
+    local workdir="$1"
+    local service="$2"
+    local env_file="${workdir}/.env"
+    local key=""
+    local fallback=""
+
+    case "$service" in
+        postgres)
+            key="POSTGRES_CONTAINER_NAME"
+            fallback="${INSTANCE_ID}-postgres"
+        ;;
+        redis)
+            key="REDIS_CONTAINER_NAME"
+            fallback="${INSTANCE_ID}-redis"
+        ;;
+        sub2api)
+            key="APP_CONTAINER_NAME"
+            fallback="${INSTANCE_ID}-app"
+        ;;
+        *)
+            echo ""
+            return 1
+        ;;
+    esac
+
+    local value
+    value="$(env_get "$key" "$env_file")"
+    echo "${value:-$fallback}"
+}
+
+container_running() {
+    local container_name="$1"
+    [[ -n "$container_name" ]] || return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)" == "true" ]]
+}
+
+wait_postgres_ready() {
+    local workdir="$1"
+    local env_file="${workdir}/.env"
+    local pg_container pg_user pg_db
+
+    pg_container="$(get_container_name "$workdir" postgres)"
+    pg_user="$(env_get POSTGRES_USER "$env_file")"
+    pg_user="${pg_user:-sub2api}"
+    pg_db="$(env_get POSTGRES_DB "$env_file")"
+    pg_db="${pg_db:-sub2api}"
+
+    info "正在等待 PostgreSQL 就绪..."
+    for _ in {1..60}; do
+        if docker exec "$pg_container" pg_isready -U "$pg_user" -d "$pg_db" >/dev/null 2>&1; then
+            info "PostgreSQL 已就绪。"
+            return 0
+        fi
+        sleep 2
+    done
+
+    err "PostgreSQL 等待超时。"
+    return 1
+}
+
+sql_literal() {
+    local value="$1"
+    value="${value//\'/\'\'}"
+    printf "'%s'" "$value"
+}
+
+pg_ident() {
+    local value="$1"
+    value="${value//\"/\"\"}"
+    printf '"%s"' "$value"
+}
+
+cleanup_old_backups() {
+    local backup_dir="$1"
+    cd "$backup_dir" || return 0
+    ls -t "${BACKUP_PREFIX}"_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -r rm -f
+}
+
+create_hot_backup() {
+    local workdir="$1"
+    local backup_file="$2"
+    local env_file="${workdir}/.env"
+    local stage_dir hot_dir pg_container redis_container
+    local pg_user pg_db pg_password redis_bgsave_before redis_bgsave_after
+    local app_data_status=0 redis_status=0 redis_rdb_ok=0 redis_bgsave_ok=0
+
+    stage_dir="$(mktemp -d)" || return 1
+    hot_dir="${stage_dir}/hot_backup"
+    mkdir -p "$hot_dir" || { rm -rf "$stage_dir"; return 1; }
+
+    cp "${workdir}/${COMPOSE_FILE}" "${stage_dir}/${COMPOSE_FILE}" || { rm -rf "$stage_dir"; return 1; }
+    [[ -f "${workdir}/${OVERRIDE_FILE}" ]] && cp "${workdir}/${OVERRIDE_FILE}" "${stage_dir}/${OVERRIDE_FILE}"
+    [[ -f "${workdir}/.env" ]] && cp "${workdir}/.env" "${stage_dir}/.env"
+
+    pg_container="$(get_container_name "$workdir" postgres)"
+    redis_container="$(get_container_name "$workdir" redis)"
+    pg_user="$(env_get POSTGRES_USER "$env_file")"
+    pg_user="${pg_user:-sub2api}"
+    pg_db="$(env_get POSTGRES_DB "$env_file")"
+    pg_db="${pg_db:-sub2api}"
+    pg_password="$(env_get POSTGRES_PASSWORD "$env_file")"
+
+    if ! container_running "$pg_container"; then
+        rm -rf "$stage_dir"
+        err "PostgreSQL 容器未运行，无法热备份: ${pg_container}"
+        return 1
+    fi
+
+    info "正在热备份 PostgreSQL 数据库，不停止服务..."
+    if ! docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
+        pg_dump -U "$pg_user" -d "$pg_db" --no-owner --no-privileges \
+        | gzip -c > "${hot_dir}/postgres_dump.sql.gz"; then
+        rm -rf "$stage_dir"
+        err "PostgreSQL pg_dump 失败。"
+        return 1
+    fi
+
+    if [[ -d "${workdir}/data" ]]; then
+        info "正在打包业务 data 目录，自动排除实时日志..."
+        if [[ -n "$(find "${workdir}/data" -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -print -quit 2>/dev/null)" ]]; then
+            warn "data 目录检测到 SQLite/DB 类活跃文件；热备份无法保证这类文件内部一致性，建议此类数据改用数据库导出或冷备。"
+        fi
+        tar --warning=no-file-changed --ignore-failed-read \
+            -czf "${hot_dir}/data.tar.gz" \
+            -C "$workdir" \
+            --exclude='data/logs' \
+            --exclude='data/*.log' \
+            --exclude='data/**/*.log' \
+            data || app_data_status=$?
+        if [[ "$app_data_status" -ne 0 ]]; then
+            warn "data 目录存在运行中变化，已尽量打包；核心数据库备份不受影响。"
+        fi
+    fi
+
+    if container_running "$redis_container"; then
+        info "正在热备份 Redis 快照..."
+        if docker exec "$redis_container" redis-cli PING >/dev/null 2>&1; then
+            redis_rdb_ok=0
+            redis_status=0
+
+            if docker exec "$redis_container" sh -c 'redis-cli --help 2>/dev/null | grep -q -- --rdb' >/dev/null 2>&1; then
+                info "Redis 支持 --rdb，优先尝试在线导出 RDB..."
+                docker exec "$redis_container" sh -c 'rm -f /tmp/sub2api_redis_dump.rdb && redis-cli --rdb /tmp/sub2api_redis_dump.rdb >/dev/null' >/dev/null 2>&1
+                if docker cp "${redis_container}:/tmp/sub2api_redis_dump.rdb" "${hot_dir}/redis_dump.rdb" >/dev/null 2>&1; then
+                    redis_rdb_ok=1
+                    redis_status=0
+                else
+                    redis_status=1
+                    warn "Redis --rdb 导出或复制失败，准备降级尝试 BGSAVE 快照。"
+                fi
+                docker exec "$redis_container" rm -f /tmp/sub2api_redis_dump.rdb >/dev/null 2>&1 || true
+            fi
+
+            if [[ "$redis_rdb_ok" -ne 1 ]]; then
+                redis_bgsave_ok=0
+                redis_bgsave_before="$(docker exec "$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+                redis_bgsave_before="${redis_bgsave_before:-0}"
+
+                docker exec "$redis_container" redis-cli BGSAVE >/dev/null 2>&1 || true
+                for _ in {1..60}; do
+                    redis_bgsave_after="$(docker exec "$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+                    redis_bgsave_after="${redis_bgsave_after:-0}"
+                    if [[ "$redis_bgsave_after" =~ ^[0-9]+$ && "$redis_bgsave_before" =~ ^[0-9]+$ && "$redis_bgsave_after" -gt "$redis_bgsave_before" ]]; then
+                        redis_bgsave_ok=1
+                        break
+                    fi
+                    sleep 1
+                done
+
+                if [[ "$redis_bgsave_ok" -ne 1 ]]; then
+                    redis_status=1
+                    warn "Redis BGSAVE 等待超时或 LASTSAVE 异常，将尝试打包现有 redis_data。"
+                fi
+
+                if [[ -d "${workdir}/redis_data" ]]; then
+                    tar --warning=no-file-changed --ignore-failed-read -czf "${hot_dir}/redis_data.tar.gz" -C "$workdir" redis_data || redis_status=$?
+                else
+                    redis_status=1
+                fi
+            fi
+        else
+            redis_status=1
+        fi
+
+        if [[ "$redis_status" -ne 0 ]]; then
+            warn "Redis 快照备份失败或不可用，已继续完成 PostgreSQL 和业务文件热备份。"
+        fi
+    else
+        warn "Redis 容器未运行，跳过 Redis 热备份: ${redis_container}"
+    fi
+
+    {
+        echo "BACKUP_TYPE=hot"
+        echo "APP_NAME=${APP_NAME}"
+        echo "INSTANCE_ID=${INSTANCE_ID}"
+        echo "BACKUP_TIME=$(date -Iseconds)"
+        echo "POSTGRES_CONTAINER=${pg_container}"
+        echo "POSTGRES_DB=${pg_db}"
+        echo "REDIS_CONTAINER=${redis_container}"
+    } > "${hot_dir}/backup_manifest.txt"
+
+    info "正在生成热备份压缩包..."
+    if ! tar -czf "$backup_file" -C "$stage_dir" .; then
+        rm -rf "$stage_dir"
+        rm -f "$backup_file"
+        err "生成备份包失败。"
+        return 1
+    fi
+
+    rm -rf "$stage_dir"
+    return 0
+}
+
 show_access() {
     local workdir="$1"
     local env_file="${workdir}/.env"
@@ -387,8 +602,7 @@ restart_service() {
 }
 
 do_backup() {
-    local workdir backup_dir timestamp backup_file item
-    local targets=()
+    local workdir backup_dir timestamp backup_file
 
     workdir="$(get_workdir)"
     [[ -n "$workdir" ]] || { err "未检测到 ${INSTANCE_ID} 部署实例。"; return; }
@@ -400,28 +614,20 @@ do_backup() {
     mkdir -p "$backup_dir"
     ensure_instance_files "$workdir" || return
 
-    for item in "$COMPOSE_FILE" "$OVERRIDE_FILE" ".env" "data" "postgres_data" "redis_data"; do
-        [[ -e "${workdir}/${item}" ]] && targets+=("$item")
-    done
-
-    if [[ "${#targets[@]}" -eq 0 ]]; then
-        err "未找到可备份的核心文件或数据目录。"
-        return
-    fi
-
-    tar -czf "$backup_file" -C "$workdir" "${targets[@]}" || {
-        err "备份失败。"
+    info "开始热备份：不会停止容器，不会中断服务。"
+    create_hot_backup "$workdir" "$backup_file" || {
+        rm -f "$backup_file"
+        err "热备份失败。"
         return
     }
 
-    cd "$backup_dir" || return
-    ls -t "${BACKUP_PREFIX}"_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -r rm -f
-
-    info "备份完成: ${backup_file}"
+    cleanup_old_backups "$backup_dir"
+    info "热备份完成: ${backup_file}"
 }
 
 restore_backup() {
     local current_wd search_dir default_backup backup_path safe_backup target_dir host_port restored_port
+    local tmp_extract is_hot_backup pg_container pg_user pg_db pg_password db_ident user_ident db_lit restore_sql
 
     current_wd="$(get_workdir)"
     search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
@@ -454,15 +660,63 @@ restore_backup() {
         }
     fi
 
-    mkdir -p "$target_dir" || return
-    tar -xzf "$safe_backup" -C "$target_dir" || {
+    tmp_extract="$(mktemp -d)" || {
+        rm -f "$safe_backup"
+        return
+    }
+
+    tar -xzf "$safe_backup" -C "$tmp_extract" || {
+        rm -rf "$tmp_extract"
         rm -f "$safe_backup"
         err "恢复失败，备份包可能已损坏。"
         return
     }
+
+    mkdir -p "$target_dir" || {
+        rm -rf "$tmp_extract"
+        rm -f "$safe_backup"
+        return
+    }
+
+    is_hot_backup=0
+    [[ -f "${tmp_extract}/hot_backup/postgres_dump.sql.gz" ]] && is_hot_backup=1
+
+    if [[ "$is_hot_backup" -eq 1 ]]; then
+        info "检测到热备份包，开始按 pg_dump 方式恢复。"
+        cp "${tmp_extract}/${COMPOSE_FILE}" "${target_dir}/${COMPOSE_FILE}" || { err "恢复编排文件失败。"; rm -rf "$tmp_extract"; rm -f "$safe_backup"; return; }
+        [[ -f "${tmp_extract}/${OVERRIDE_FILE}" ]] && cp "${tmp_extract}/${OVERRIDE_FILE}" "${target_dir}/${OVERRIDE_FILE}"
+        [[ -f "${tmp_extract}/.env" ]] && cp "${tmp_extract}/.env" "${target_dir}/.env"
+
+        mkdir -p "${target_dir}"/{data,postgres_data,redis_data,backups}
+        cp "${tmp_extract}/hot_backup/postgres_dump.sql.gz" "${target_dir}/backups/postgres_dump.sql.gz" || {
+            err "复制 PostgreSQL 热备份 SQL 失败。"
+            rm -rf "$tmp_extract"
+            rm -f "$safe_backup"
+            return
+        }
+        [[ -f "${tmp_extract}/hot_backup/backup_manifest.txt" ]] && cp "${tmp_extract}/hot_backup/backup_manifest.txt" "${target_dir}/backups/backup_manifest.txt" 2>/dev/null || true
+        if [[ -f "${tmp_extract}/hot_backup/data.tar.gz" ]]; then
+            tar -xzf "${tmp_extract}/hot_backup/data.tar.gz" -C "$target_dir" || warn "业务 data 恢复不完整，请检查。"
+        fi
+        if [[ -f "${tmp_extract}/hot_backup/redis_dump.rdb" ]]; then
+            cp "${tmp_extract}/hot_backup/redis_dump.rdb" "${target_dir}/redis_data/dump.rdb" || warn "Redis RDB 恢复文件复制失败。"
+        elif [[ -f "${tmp_extract}/hot_backup/redis_data.tar.gz" ]]; then
+            tar -xzf "${tmp_extract}/hot_backup/redis_data.tar.gz" -C "$target_dir" || warn "Redis 数据目录恢复不完整，请检查。"
+        fi
+    else
+        info "检测到旧版冷备份包，按原目录结构恢复。"
+        cp -a "${tmp_extract}/." "$target_dir/" || {
+            rm -rf "$tmp_extract"
+            rm -f "$safe_backup"
+            err "恢复文件复制失败。"
+            return
+        }
+    fi
+
     mkdir -p "${target_dir}/backups"
     cp "$safe_backup" "${target_dir}/backups/$(basename "$safe_backup")" 2>/dev/null || true
     rm -f "$safe_backup"
+    rm -rf "$tmp_extract"
 
     echo "$target_dir" > "$ENV_RECORD_FILE"
     ensure_instance_files "$target_dir" || return
@@ -478,10 +732,55 @@ restore_backup() {
     mkdir -p "${target_dir}"/{data,postgres_data,redis_data,backups}
     chmod -R 777 "${target_dir}/data" "${target_dir}/postgres_data" "${target_dir}/redis_data" || true
 
-    compose "$target_dir" up -d || {
-        err "恢复后的容器启动失败。"
-        return
-    }
+    if [[ "$is_hot_backup" -eq 1 ]]; then
+        info "正在启动 PostgreSQL / Redis，用于导入热备份数据..."
+        compose "$target_dir" up -d postgres redis || {
+            err "恢复基础容器启动失败。"
+            return
+        }
+        wait_postgres_ready "$target_dir" || return
+
+        pg_container="$(get_container_name "$target_dir" postgres)"
+        pg_user="$(env_get POSTGRES_USER "${target_dir}/.env")"
+        pg_user="${pg_user:-sub2api}"
+        pg_db="$(env_get POSTGRES_DB "${target_dir}/.env")"
+        pg_db="${pg_db:-sub2api}"
+        pg_password="$(env_get POSTGRES_PASSWORD "${target_dir}/.env")"
+        db_ident="$(pg_ident "$pg_db")"
+        user_ident="$(pg_ident "$pg_user")"
+        db_lit="$(sql_literal "$pg_db")"
+        restore_sql="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ${db_lit} AND pid <> pg_backend_pid(); DROP DATABASE IF EXISTS ${db_ident}; CREATE DATABASE ${db_ident} OWNER ${user_ident};"
+
+        info "正在重建并导入 PostgreSQL 数据库..."
+        docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
+            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 -c "$restore_sql" || {
+            err "重建数据库失败。"
+            return
+        }
+
+        local sql_dump_path
+        sql_dump_path="${target_dir}/backups/postgres_dump.sql.gz"
+        [[ -f "$sql_dump_path" ]] || {
+            err "无法读取热备份 SQL 文件。"
+            return
+        }
+        gzip -dc "$sql_dump_path" | docker exec -i -e PGPASSWORD="$pg_password" "$pg_container" \
+            psql -U "$pg_user" -d "$pg_db" -v ON_ERROR_STOP=1 || {
+            err "导入 PostgreSQL 数据失败。"
+            return
+        }
+
+
+        compose "$target_dir" up -d || {
+            err "恢复后的容器启动失败。"
+            return
+        }
+    else
+        compose "$target_dir" up -d || {
+            err "恢复后的容器启动失败。"
+            return
+        }
+    fi
 
     wait_app_ready "$target_dir" || true
     show_access "$target_dir"
@@ -497,8 +796,8 @@ setup_auto_backup() {
 
     cron_script="${workdir}/cron_backup.sh"
 
-    echo "  1) 按固定分钟间隔备份"
-    echo "  2) 按每日固定时间点备份"
+    echo "  1) 按固定分钟间隔热备份"
+    echo "  2) 按每日固定时间点热备份"
     echo "  3) 删除当前定时备份任务"
     read_default "请选择策略" "1" cron_type
 
@@ -542,10 +841,181 @@ setup_auto_backup() {
     cat > "$cron_script" <<EOF
 #!/usr/bin/env bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
+set -o pipefail
+
+INSTANCE_ID="${INSTANCE_ID}"
+APP_NAME="${APP_NAME}"
 WORKDIR="${workdir}"
-BACKUP_PREFIX="${BACKUP_PREFIX}"
 COMPOSE_FILE="${COMPOSE_FILE}"
 OVERRIDE_FILE="${OVERRIDE_FILE}"
+BACKUP_PREFIX="${BACKUP_PREFIX}"
+
+info() { echo -e "\\033[32m[INFO]\\033[0m \$1"; }
+warn() { echo -e "\\033[33m[WARN]\\033[0m \$1" >&2; }
+err()  { echo -e "\\033[31m[ERROR]\\033[0m \$1" >&2; }
+
+env_get() {
+    local key="\$1"
+    local env_file="\$2"
+    grep -E "^\${key}=" "\$env_file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+}
+
+docker_compose_cmd() {
+    if command -v docker-compose >/dev/null 2>&1; then
+        echo "docker-compose"
+    elif docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    else
+        err "未检测到 Docker Compose。"
+        exit 1
+    fi
+}
+
+get_container_name() {
+    local service="\$1"
+    local env_file="\${WORKDIR}/.env"
+    local key=""
+    local fallback=""
+    case "\$service" in
+        postgres) key="POSTGRES_CONTAINER_NAME"; fallback="\${INSTANCE_ID}-postgres" ;;
+        redis) key="REDIS_CONTAINER_NAME"; fallback="\${INSTANCE_ID}-redis" ;;
+        sub2api) key="APP_CONTAINER_NAME"; fallback="\${INSTANCE_ID}-app" ;;
+    esac
+    local value
+    value="\$(env_get "\$key" "\$env_file")"
+    echo "\${value:-\$fallback}"
+}
+
+container_running() {
+    local container_name="\$1"
+    [[ -n "\$container_name" ]] || return 1
+    [[ "\$(docker inspect -f '{{.State.Running}}' "\$container_name" 2>/dev/null || true)" == "true" ]]
+}
+
+cleanup_old_backups() {
+    local backup_dir="\$1"
+    cd "\$backup_dir" || return 0
+    ls -t "\${BACKUP_PREFIX}"_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -r rm -f
+}
+
+create_hot_backup() {
+    local backup_file="\$1"
+    local env_file="\${WORKDIR}/.env"
+    local stage_dir hot_dir pg_container redis_container
+    local pg_user pg_db pg_password redis_bgsave_before redis_bgsave_after
+    local app_data_status=0 redis_status=0 redis_rdb_ok=0 redis_bgsave_ok=0
+
+    stage_dir="\$(mktemp -d)" || return 1
+    hot_dir="\${stage_dir}/hot_backup"
+    mkdir -p "\$hot_dir" || { rm -rf "\$stage_dir"; return 1; }
+
+    cp "\${WORKDIR}/\${COMPOSE_FILE}" "\${stage_dir}/\${COMPOSE_FILE}" || { rm -rf "\$stage_dir"; return 1; }
+    [[ -f "\${WORKDIR}/\${OVERRIDE_FILE}" ]] && cp "\${WORKDIR}/\${OVERRIDE_FILE}" "\${stage_dir}/\${OVERRIDE_FILE}"
+    [[ -f "\${WORKDIR}/.env" ]] && cp "\${WORKDIR}/.env" "\${stage_dir}/.env"
+
+    pg_container="\$(get_container_name postgres)"
+    redis_container="\$(get_container_name redis)"
+    pg_user="\$(env_get POSTGRES_USER "\$env_file")"
+    pg_user="\${pg_user:-sub2api}"
+    pg_db="\$(env_get POSTGRES_DB "\$env_file")"
+    pg_db="\${pg_db:-sub2api}"
+    pg_password="\$(env_get POSTGRES_PASSWORD "\$env_file")"
+
+    if ! container_running "\$pg_container"; then
+        rm -rf "\$stage_dir"
+        err "PostgreSQL 容器未运行，无法热备份: \${pg_container}"
+        return 1
+    fi
+
+    info "正在热备份 PostgreSQL 数据库，不停止服务..."
+    if ! docker exec -e PGPASSWORD="\$pg_password" "\$pg_container" pg_dump -U "\$pg_user" -d "\$pg_db" --no-owner --no-privileges | gzip -c > "\${hot_dir}/postgres_dump.sql.gz"; then
+        rm -rf "\$stage_dir"
+        err "PostgreSQL pg_dump 失败。"
+        return 1
+    fi
+
+    if [[ -d "\${WORKDIR}/data" ]]; then
+        info "正在打包业务 data 目录，自动排除实时日志..."
+        if [[ -n "\$(find "\${WORKDIR}/data" -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -print -quit 2>/dev/null)" ]]; then
+            warn "data 目录检测到 SQLite/DB 类活跃文件；热备份无法保证这类文件内部一致性，建议此类数据改用数据库导出或冷备。"
+        fi
+        tar --warning=no-file-changed --ignore-failed-read -czf "\${hot_dir}/data.tar.gz" -C "\$WORKDIR" --exclude='data/logs' --exclude='data/*.log' --exclude='data/**/*.log' data || app_data_status=\$?
+        [[ "\$app_data_status" -ne 0 ]] && warn "data 目录存在运行中变化，已尽量打包；核心数据库备份不受影响。"
+    fi
+
+    if container_running "\$redis_container"; then
+        info "正在热备份 Redis 快照..."
+        if docker exec "\$redis_container" redis-cli PING >/dev/null 2>&1; then
+            redis_rdb_ok=0
+            redis_status=0
+
+            if docker exec "\$redis_container" sh -c 'redis-cli --help 2>/dev/null | grep -q -- --rdb' >/dev/null 2>&1; then
+                info "Redis 支持 --rdb，优先尝试在线导出 RDB..."
+                docker exec "\$redis_container" sh -c 'rm -f /tmp/sub2api_redis_dump.rdb && redis-cli --rdb /tmp/sub2api_redis_dump.rdb >/dev/null' >/dev/null 2>&1
+                if docker cp "\${redis_container}:/tmp/sub2api_redis_dump.rdb" "\${hot_dir}/redis_dump.rdb" >/dev/null 2>&1; then
+                    redis_rdb_ok=1
+                    redis_status=0
+                else
+                    redis_status=1
+                    warn "Redis --rdb 导出或复制失败，准备降级尝试 BGSAVE 快照。"
+                fi
+                docker exec "\$redis_container" rm -f /tmp/sub2api_redis_dump.rdb >/dev/null 2>&1 || true
+            fi
+
+            if [[ "\$redis_rdb_ok" -ne 1 ]]; then
+                redis_bgsave_ok=0
+                redis_bgsave_before="\$(docker exec "\$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+                redis_bgsave_before="\${redis_bgsave_before:-0}"
+
+                docker exec "\$redis_container" redis-cli BGSAVE >/dev/null 2>&1 || true
+                for _ in {1..60}; do
+                    redis_bgsave_after="\$(docker exec "\$redis_container" redis-cli LASTSAVE 2>/dev/null | tr -cd '0-9' || true)"
+                    redis_bgsave_after="\${redis_bgsave_after:-0}"
+                    if [[ "\$redis_bgsave_after" =~ ^[0-9]+$ && "\$redis_bgsave_before" =~ ^[0-9]+$ && "\$redis_bgsave_after" -gt "\$redis_bgsave_before" ]]; then
+                        redis_bgsave_ok=1
+                        break
+                    fi
+                    sleep 1
+                done
+
+                if [[ "\$redis_bgsave_ok" -ne 1 ]]; then
+                    redis_status=1
+                    warn "Redis BGSAVE 等待超时或 LASTSAVE 异常，将尝试打包现有 redis_data。"
+                fi
+
+                if [[ -d "\${WORKDIR}/redis_data" ]]; then
+                    tar --warning=no-file-changed --ignore-failed-read -czf "\${hot_dir}/redis_data.tar.gz" -C "\$WORKDIR" redis_data || redis_status=\$?
+                else
+                    redis_status=1
+                fi
+            fi
+        else
+            redis_status=1
+        fi
+        [[ "\$redis_status" -ne 0 ]] && warn "Redis 快照备份失败或不可用，已继续完成 PostgreSQL 和业务文件热备份。"
+    else
+        warn "Redis 容器未运行，跳过 Redis 热备份: \${redis_container}"
+    fi
+
+    {
+        echo "BACKUP_TYPE=hot"
+        echo "APP_NAME=\${APP_NAME}"
+        echo "INSTANCE_ID=\${INSTANCE_ID}"
+        echo "BACKUP_TIME=\$(date -Iseconds)"
+        echo "POSTGRES_CONTAINER=\${pg_container}"
+        echo "POSTGRES_DB=\${pg_db}"
+        echo "REDIS_CONTAINER=\${redis_container}"
+    } > "\${hot_dir}/backup_manifest.txt"
+
+    info "正在生成热备份压缩包..."
+    if ! tar -czf "\$backup_file" -C "\$stage_dir" .; then
+        rm -rf "\$stage_dir"
+        rm -f "\$backup_file"
+        err "生成备份包失败。"
+        return 1
+    fi
+    rm -rf "\$stage_dir"
+}
 
 cd "\$WORKDIR" || exit 1
 BACKUP_DIR="\${WORKDIR}/backups"
@@ -553,16 +1023,14 @@ TIMESTAMP=\$(date +"%Y%m%d_%H%M%S")
 BACKUP_FILE="\${BACKUP_DIR}/\${BACKUP_PREFIX}_\${TIMESTAMP}.tar.gz"
 mkdir -p "\$BACKUP_DIR"
 
-TARGETS=()
-for item in "\$COMPOSE_FILE" "\$OVERRIDE_FILE" ".env" "data" "postgres_data" "redis_data"; do
-    [[ -e "\${WORKDIR}/\${item}" ]] && TARGETS+=("\$item")
-done
-
-if [[ "\${#TARGETS[@]}" -gt 0 ]]; then
-    tar -czf "\$BACKUP_FILE" -C "\$WORKDIR" "\${TARGETS[@]}"
-    cd "\$BACKUP_DIR" || exit 1
-    ls -t "\${BACKUP_PREFIX}"_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -r rm -f
-fi
+info "开始定时热备份：不会停止容器，不会中断服务。"
+create_hot_backup "\$BACKUP_FILE" || {
+    rm -f "\$BACKUP_FILE"
+    err "定时热备份失败。"
+    exit 1
+}
+cleanup_old_backups "\$BACKUP_DIR"
+info "定时热备份完成: \${BACKUP_FILE}"
 EOF
     chmod +x "$cron_script"
 
@@ -581,7 +1049,7 @@ EOF
     }
     rm -f "$tmp_cron"
 
-    info "新的定时备份任务已写入:"
+    info "新的定时热备份任务已写入:"
     echo "${cron_spec} bash ${cron_script} >> ${BACKUP_LOG} 2>&1"
 }
 
