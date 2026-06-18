@@ -8,7 +8,7 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 set -o pipefail
 
-APP_NAME="Sub2API 2"
+APP_NAME="Sub2API2"
 INSTANCE_ID="${SUB2API_INSTANCE_ID:-sub2api2}"
 DEFAULT_PORT="${SUB2API_DEFAULT_PORT:-6083}"
 DEFAULT_INSTALL_PATH="${SUB2API_INSTALL_PATH:-/opt/${INSTANCE_ID}}"
@@ -772,27 +772,27 @@ restore_backup() {
 
         info "正在重建 PostgreSQL 数据库..."
         docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
-            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
-            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ${db_lit} AND pid <> pg_backend_pid();" || {
+            psql -q -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ${db_lit} AND pid <> pg_backend_pid();" >/dev/null || {
             err "终止数据库连接失败。"
             return
         }
 
         docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
-            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
-            -c "DROP DATABASE IF EXISTS ${db_ident};" || {
+            psql -q -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS ${db_ident};" >/dev/null || {
             err "删除旧数据库失败。"
             return
         }
 
         docker exec -e PGPASSWORD="$pg_password" "$pg_container" \
-            psql -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
-            -c "CREATE DATABASE ${db_ident} OWNER ${user_ident};" || {
+            psql -q -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE ${db_ident} OWNER ${user_ident};" >/dev/null || {
             err "创建新数据库失败。"
             return
         }
 
-        info "正在导入 PostgreSQL 数据..."
+        info "正在导入 PostgreSQL 数据，请稍等..."
 
         local sql_dump_path
         sql_dump_path="${target_dir}/backups/postgres_dump.sql.gz"
@@ -801,10 +801,11 @@ restore_backup() {
             return
         }
         gzip -dc "$sql_dump_path" | docker exec -i -e PGPASSWORD="$pg_password" "$pg_container" \
-            psql -U "$pg_user" -d "$pg_db" -v ON_ERROR_STOP=1 || {
+            psql -q -U "$pg_user" -d "$pg_db" -v ON_ERROR_STOP=1 >/dev/null || {
             err "导入 PostgreSQL 数据失败。"
             return
         }
+        info "PostgreSQL 数据导入完成。"
 
 
         compose "$target_dir" up -d || {
