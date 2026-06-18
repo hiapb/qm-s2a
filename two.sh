@@ -8,7 +8,7 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 set -o pipefail
 
-APP_NAME="Sub2API"
+APP_NAME="Sub2API2"
 INSTANCE_ID="${SUB2API_INSTANCE_ID:-sub2api2}"
 DEFAULT_PORT="${SUB2API_DEFAULT_PORT:-6083}"
 DEFAULT_INSTALL_PATH="${SUB2API_INSTALL_PATH:-/opt/${INSTANCE_ID}}"
